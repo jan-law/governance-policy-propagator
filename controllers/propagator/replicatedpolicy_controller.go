@@ -17,6 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	policiesv1 "open-cluster-management.io/governance-policy-propagator/api/v1"
+	policiesv1beta1 "open-cluster-management.io/governance-policy-propagator/api/v1beta1"
 	"open-cluster-management.io/governance-policy-propagator/controllers/common"
 )
 
@@ -476,7 +477,26 @@ func (r *ReplicatedPolicyReconciler) isSingleClusterInDecisions(
 				subjectFound = true
 			}
 		case policiesv1.PolicySetKind:
-			if common.IsPolicyInPolicySet(ctx, r.Client, policyName, subject.Name, pb.GetNamespace()) {
+			policySet := policiesv1beta1.PolicySet{}
+			setNN := types.NamespacedName{
+				Name:      subject.Name,
+				Namespace: pb.GetNamespace(),
+			}
+
+			if err := r.Get(ctx, setNN, &policySet); err != nil {
+				if !k8serrors.IsNotFound(err) {
+					return false, fmt.Errorf("failed to get PolicySet '%v': %w", subject.Name, err)
+				}
+
+				continue
+			}
+
+			if common.IsPolicyListedInPolicySet(&policySet, policyName) {
+				excluded := common.ExcludedClustersForListedPolicy(&policySet, policyName)
+				if _, ok := excluded[clusterName]; ok {
+					continue
+				}
+
 				subjectFound = true
 			}
 		}

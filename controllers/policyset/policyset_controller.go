@@ -141,9 +141,11 @@ func (r *PolicySetReconciler) processPolicySet(
 	deletedPolicies := []string{}
 	unknownPolicies := []string{}
 	disabledPolicies := []string{}
+	invalidExclusionPolicies := []string{}
 	pendingPolicies := []string{}
 	aggregatedCompliance := policyv1.Compliant
 	placementsByBinding := map[string]policyv1beta1.PolicySetStatusPlacement{}
+	decisionsByBinding := map[string][]string{}
 
 	// if there are no policies in the policyset, status should be empty
 	if len(plcSet.Spec.Policies) == 0 {
@@ -157,6 +159,8 @@ func (r *PolicySetReconciler) processPolicySet(
 
 		return false
 	}
+
+	exclusionSummary := common.SummarizePolicySetExclusions(plcSet)
 
 	for i := range plcSet.Spec.Policies {
 		childPlcName := plcSet.Spec.Policies[i]
@@ -213,37 +217,48 @@ func (r *PolicySetReconciler) processPolicySet(
 			clusters := []string{}
 
 			for pbName := range placementsByBinding {
-				pbNamespacedName := types.NamespacedName{
-					Name:      pbName,
-					Namespace: plcSet.Namespace,
-				}
-
-				pb := &policyv1.PlacementBinding{}
-
-				err := r.Get(ctx, pbNamespacedName, pb)
-				if err != nil {
-					if errors.IsNotFound(err) {
-						log.V(1).Info("The placement binding was not found", "placementBinding", pbName)
-					} else {
-						log.Error(err, "Failed to get the placement binding", "placementBinding", pbName)
+				clusterDecisions, cached := decisionsByBinding[pbName]
+				if !cached {
+					pbNamespacedName := types.NamespacedName{
+						Name:      pbName,
+						Namespace: plcSet.Namespace,
 					}
 
-					continue
+					pb := &policyv1.PlacementBinding{}
+
+					err := r.Get(ctx, pbNamespacedName, pb)
+					if err != nil {
+						if errors.IsNotFound(err) {
+							log.V(1).Info("The placement binding was not found", "placementBinding", pbName)
+						} else {
+							log.Error(err, "Failed to get the placement binding", "placementBinding", pbName)
+						}
+
+						decisionsByBinding[pbName] = nil
+
+						continue
+					}
+
+					clusterDecisions, err = common.GetDecisions(ctx, r.Client, pb)
+					if err != nil {
+						log.Error(
+							err, "Failed to get placement decisions for the placement binding", "placementBinding", pbName,
+						)
+
+						decisionsByBinding[pbName] = nil
+
+						continue
+					}
+
+					decisionsByBinding[pbName] = clusterDecisions
 				}
 
-				var clusterDecisions []string
-
-				clusterDecisions, err = common.GetDecisions(ctx, r.Client, pb)
-				if err != nil {
-					log.Error(
-						err, "Failed to get placement decisions for the placement binding", "placementBinding", pbName,
-					)
-
-					continue
+				if clusterDecisions != nil {
+					clusters = append(clusters, clusterDecisions...)
 				}
-
-				clusters = append(clusters, clusterDecisions...)
 			}
+
+			clusters = common.FilterExcludedPolicySetClustersForListedPolicy(plcSet, string(childPlcName), clusters)
 
 			// aggregate compliance state
 			plcComplianceState := complianceInRelevantClusters(childPlc.Status.Status, clusters)
@@ -267,14 +282,30 @@ func (r *PolicySetReconciler) processPolicySet(
 		}
 	}
 
+	invalidExclusionPolicies = exclusionSummary.InvalidPolicyNames
+	for _, policyName := range invalidExclusionPolicies {
+		r.Recorder.Eventf(plcSet, nil, "Warning", "InvalidExclusionPolicy", "InvalidExclusionPolicy",
+			fmt.Sprintf(
+				"Policy %s is excluded in PolicySet %s but is not listed in spec.policies in namespace %s",
+				policyName,
+				plcSet.GetName(),
+				plcSet.GetNamespace(),
+			),
+		)
+	}
+
 	generatedPlacements := []policyv1beta1.PolicySetStatusPlacement{}
 	for _, pcmt := range placementsByBinding {
 		generatedPlacements = append(generatedPlacements, pcmt)
 	}
 
 	builtStatus := policyv1beta1.PolicySetStatus{
-		Placement:     generatedPlacements,
-		StatusMessage: getStatusMessage(disabledPolicies, unknownPolicies, deletedPolicies, pendingPolicies),
+		Placement:  generatedPlacements,
+		Exclusions: exclusionSummary.StatusExclusions,
+		StatusMessage: getStatusMessage(
+			disabledPolicies, exclusionSummary.ClusterExcludedMessages, invalidExclusionPolicies, unknownPolicies,
+			deletedPolicies, pendingPolicies,
+		),
 	}
 	if showCompliance(compliancesFound, unknownPolicies, pendingPolicies) {
 		builtStatus.Compliant = aggregatedCompliance
@@ -291,6 +322,8 @@ func (r *PolicySetReconciler) processPolicySet(
 // getStatusMessage returns a message listing disabled, deleted and policies with no status
 func getStatusMessage(
 	disabledPolicies []string,
+	clusterExcludedPolicies []string,
+	invalidExclusionPolicies []string,
 	unknownPolicies []string,
 	deletedPolicies []string,
 	pendingPolicies []string,
@@ -308,6 +341,22 @@ func getStatusMessage(
 	if len(disabledPolicies) > 0 {
 		allReporting = false
 		statusMessage += fmt.Sprintf(separator+"Disabled policies: %s", strings.Join(disabledPolicies, ", "))
+		separator = "; "
+	}
+
+	if len(clusterExcludedPolicies) > 0 {
+		allReporting = false
+		statusMessage += fmt.Sprintf(
+			separator+"Cluster excluded policies: %s", strings.Join(clusterExcludedPolicies, "; "),
+		)
+		separator = "; "
+	}
+
+	if len(invalidExclusionPolicies) > 0 {
+		allReporting = false
+		statusMessage += fmt.Sprintf(
+			separator+"Invalid exclusions: %s", strings.Join(invalidExclusionPolicies, ", "),
+		)
 		separator = "; "
 	}
 

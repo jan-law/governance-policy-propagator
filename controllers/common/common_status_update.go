@@ -18,9 +18,12 @@ import (
 	policiesv1beta1 "open-cluster-management.io/governance-policy-propagator/api/v1beta1"
 )
 
+// DecisionSet is a set of managed cluster names selected for policy propagation.
+type DecisionSet map[string]bool
+
 // RootStatusUpdate updates the root policy status with bound decisions, placements, and cluster status.
 func RootStatusUpdate(ctx context.Context, c client.Client, rootPolicy *policiesv1.Policy) (DecisionSet, error) {
-	placements, decisions, err := GetClusterDecisions(ctx, c, rootPolicy)
+	placements, decisions, remainingBindings, err := collectRootPolicyPlacementState(ctx, c, rootPolicy)
 	if err != nil {
 		log.Info("Failed to get any placement decisions. Giving up on the request.")
 
@@ -31,6 +34,12 @@ func RootStatusUpdate(ctx context.Context, c client.Client, rootPolicy *policies
 	if cpcsErr != nil {
 		// If there is a new replicated policy, then its lookup is expected to fail - it hasn't been created yet.
 		log.Error(cpcsErr, "Failed to get at least one replicated policy, but that may be expected. Ignoring.")
+	}
+
+	for _, status := range cpcs {
+		if bindings, ok := remainingBindings[status.ClusterName]; ok {
+			status.RemainingBindings = bindings
+		}
 	}
 
 	err = c.Get(ctx,
@@ -69,94 +78,10 @@ func RootStatusUpdate(ctx context.Context, c client.Client, rootPolicy *policies
 func GetPolicyPlacementDecisions(ctx context.Context, c client.Client,
 	instance *policiesv1.Policy, pb *policiesv1.PlacementBinding,
 ) (clusterDecisions []string, placements []*policiesv1.Placement, err error) {
-	policySubjectFound := false
-	policySetSubjects := make(map[string]struct{}) // a set, to prevent duplicates
-
-	for _, subject := range pb.Subjects {
-		if subject.APIGroup != policiesv1.SchemeGroupVersion.Group {
-			continue
-		}
-
-		switch subject.Kind {
-		case policiesv1.Kind:
-			if !policySubjectFound && subject.Name == instance.GetName() {
-				policySubjectFound = true
-
-				placements = append(placements, &policiesv1.Placement{
-					PlacementBinding: pb.GetName(),
-				})
-			}
-		case policiesv1.PolicySetKind:
-			if _, exists := policySetSubjects[subject.Name]; !exists {
-				policySetSubjects[subject.Name] = struct{}{}
-
-				if IsPolicyInPolicySet(ctx, c, instance.GetName(), subject.Name, pb.GetNamespace()) {
-					placements = append(placements, &policiesv1.Placement{
-						PlacementBinding: pb.GetName(),
-						PolicySet:        subject.Name,
-					})
-				}
-			}
-		}
-	}
-
-	if len(placements) == 0 {
-		// None of the subjects in the PlacementBinding were relevant to this Policy.
-		return nil, nil, nil
-	}
-
-	// If the PlacementRef is invalid, log and return. (This is not recoverable.)
-	if !HasValidPlacementRef(pb) {
-		log.Info(fmt.Sprintf("Placement binding %s/%s placementRef is not valid. Ignoring.", pb.Namespace, pb.Name))
-
-		return nil, nil, nil
-	}
-
-	// If the placementRef exists, then it needs to be added to the placement item
-	refNN := types.NamespacedName{
-		Namespace: pb.GetNamespace(),
-		Name:      pb.PlacementRef.Name,
-	}
-
-	switch pb.PlacementRef.Kind {
-	case "PlacementRule":
-		plr := &appsv1.PlacementRule{}
-		if err := c.Get(ctx, refNN, plr); err != nil && !k8serrors.IsNotFound(err) {
-			return nil, nil, fmt.Errorf("failed to check for PlacementRule '%v': %w", pb.PlacementRef.Name, err)
-		}
-
-		for i := range placements {
-			placements[i].PlacementRule = plr.Name // will be empty if the PlacementRule was not found
-		}
-	case "Placement":
-		pl := &clusterv1beta1.Placement{}
-		if err := c.Get(ctx, refNN, pl); err != nil && !k8serrors.IsNotFound(err) {
-			return nil, nil, fmt.Errorf("failed to check for Placement '%v': %w", pb.PlacementRef.Name, err)
-		}
-
-		for i := range placements {
-			placements[i].Placement = pl.Name // will be empty if the Placement was not found
-		}
-	}
-
-	// If there are no placements, then the PlacementBinding is not for this Policy.
-	if len(placements) == 0 {
-		return nil, nil, nil
-	}
-
-	// If the policy is disabled, don't return any decisions, so that the policy isn't put on any clusters
-	if instance.Spec.Disabled {
-		return nil, placements, nil
-	}
-
-	clusterDecisions, err = GetDecisions(ctx, c, pb)
-
-	return clusterDecisions, placements, err
+	return getPolicyPlacementDecisions(ctx, c, instance, pb, nil, nil)
 }
 
-type DecisionSet map[string]bool
-
-// GetClusterDecisions identifies all managed clusters which should have a replicated policy using the root policy
+// GetClusterDecisions identifies all managed clusters which should have a replicated policy using the root policy.
 // This returns unique decisions and placements that are NOT under Restricted subset.
 // Also this function returns placements that are under restricted subset.
 // But these placements include decisions which are under non-restricted subset.
@@ -169,86 +94,33 @@ func GetClusterDecisions(
 	[]*policiesv1.Placement, DecisionSet, error,
 ) {
 	log := log.WithValues("policyName", rootPolicy.GetName(), "policyNamespace", rootPolicy.GetNamespace())
-	decisions := make(map[string]bool)
 
-	pbList := &policiesv1.PlacementBindingList{}
-
-	err := c.List(ctx, pbList, &client.ListOptions{Namespace: rootPolicy.GetNamespace()})
+	states, err := collectBindingPlacementStates(ctx, c, rootPolicy)
 	if err != nil {
 		log.Error(err, "Could not list the placement bindings")
 
-		return nil, decisions, err
+		return nil, nil, err
 	}
 
-	placements := []*policiesv1.Placement{}
-
-	// Gather all placements and decisions when it is NOT policiesv1.Restricted
-	for i, pb := range pbList.Items {
-		if pb.SubFilter == policiesv1.Restricted {
-			continue
-		}
-
-		plcDecisions, plcPlacements, err := GetPolicyPlacementDecisions(ctx, c, rootPolicy, &pbList.Items[i])
-		if err != nil {
-			return nil, nil, err
-		}
-
-		if len(plcDecisions) == 0 {
-			log.V(1).Info("No placement decisions to process for this policy from this non-restricted binding",
-				"policyName", rootPolicy.GetName(), "bindingName", pb.GetName())
-		}
-
-		// Decisions are all unique
-		for _, clusterName := range plcDecisions {
-			decisions[clusterName] = true
-		}
-
-		placements = append(placements, plcPlacements...)
-	}
-
-	// Gather placements which have at least one decision that is included in NON-Restricted
-	for i, pb := range pbList.Items {
-		if pb.SubFilter != policiesv1.Restricted {
-			continue
-		}
-
-		foundInDecisions := false
-
-		plcDecisions, plcPlacements, err := GetPolicyPlacementDecisions(ctx, c, rootPolicy, &pbList.Items[i])
-		if err != nil {
-			return nil, nil, err
-		}
-
-		if len(plcDecisions) == 0 {
-			log.V(1).Info("No placement decisions to process for this policy from this restricted binding",
-				"policyName", rootPolicy.GetName(), "bindingName", pb.GetName())
-		}
-
-		// Decisions are all unique
-		for _, clusterName := range plcDecisions {
-			if _, ok := decisions[clusterName]; ok {
-				foundInDecisions = true
-			}
-
-			decisions[clusterName] = true
-		}
-
-		if foundInDecisions {
-			placements = append(placements, plcPlacements...)
-		}
-	}
-
-	log.V(2).Info("Sorting placements", "RootPolicyName", rootPolicy.Name, "Namespace", rootPolicy.Namespace)
-	sort.SliceStable(placements, func(i, j int) bool {
-		pi := placements[i].PlacementBinding + " " + placements[i].Placement + " " +
-			placements[i].PlacementRule + " " + placements[i].PolicySet
-		pj := placements[j].PlacementBinding + " " + placements[j].Placement + " " +
-			placements[j].PlacementRule + " " + placements[j].PolicySet
-
-		return pi < pj
-	})
+	placements, decisions := clusterDecisionsFromBindingStates(rootPolicy, states)
 
 	return placements, decisions, nil
+}
+
+// ComputeRemainingBindings identifies placement bindings that still place a policy on a cluster when
+// the policy is excluded on another PolicySet binding path.
+func ComputeRemainingBindings(
+	ctx context.Context,
+	c client.Client,
+	rootPolicy *policiesv1.Policy,
+	decisions DecisionSet,
+) (map[string][]policiesv1.RemainingBinding, error) {
+	states, err := collectBindingPlacementStates(ctx, c, rootPolicy)
+	if err != nil {
+		return nil, err
+	}
+
+	return remainingBindingsFromBindingStates(rootPolicy, states, decisions), nil
 }
 
 // CalculatePerClusterStatus lists up all policies replicated from the input policy, and stores
@@ -302,30 +174,6 @@ func CalculatePerClusterStatus(
 	return status, lookupErr
 }
 
-func IsPolicyInPolicySet(ctx context.Context, c client.Client, policyName, policySetName, namespace string) bool {
-	log := log.WithValues("policyName", policyName, "policySetName", policySetName, "policyNamespace", namespace)
-
-	policySet := policiesv1beta1.PolicySet{}
-	setNN := types.NamespacedName{
-		Name:      policySetName,
-		Namespace: namespace,
-	}
-
-	if err := c.Get(ctx, setNN, &policySet); err != nil {
-		log.Error(err, "Failed to get the policyset")
-
-		return false
-	}
-
-	for _, plc := range policySet.Spec.Policies {
-		if string(plc) == policyName {
-			return true
-		}
-	}
-
-	return false
-}
-
 // CalculateRootCompliance uses the input per-cluster statuses to determine what a root policy's
 // ComplianceState should be. General precedence is: NonCompliant > Pending > Unknown > Compliant.
 func CalculateRootCompliance(clusters []*policiesv1.CompliancePerClusterStatus) policiesv1.ComplianceState {
@@ -361,4 +209,380 @@ func CalculateRootCompliance(clusters []*policiesv1.CompliancePerClusterStatus) 
 
 	// Returns compliant if, and only if, *all* cluster statuses are Compliant
 	return policiesv1.Compliant
+}
+
+type policyBindingSubjects struct {
+	policySubjectFound bool
+	policySetSubjects  map[string]*policiesv1beta1.PolicySet
+	placements         []*policiesv1.Placement
+}
+
+type bindingPlacementState struct {
+	pb                *policiesv1.PlacementBinding
+	rawDecisions      []string
+	filteredDecisions []string
+	placements        []*policiesv1.Placement
+	trackRemaining    bool
+}
+
+func resolvePolicyBindingSubjects(
+	ctx context.Context,
+	c client.Client,
+	instance *policiesv1.Policy,
+	pb *policiesv1.PlacementBinding,
+) (policyBindingSubjects, error) {
+	subjects := policyBindingSubjects{
+		policySetSubjects: make(map[string]*policiesv1beta1.PolicySet),
+	}
+
+	for _, subject := range pb.Subjects {
+		if subject.APIGroup != policiesv1.SchemeGroupVersion.Group {
+			continue
+		}
+
+		switch subject.Kind {
+		case policiesv1.Kind:
+			if !subjects.policySubjectFound && subject.Name == instance.GetName() {
+				subjects.policySubjectFound = true
+
+				subjects.placements = append(subjects.placements, &policiesv1.Placement{
+					PlacementBinding: pb.GetName(),
+				})
+			}
+		case policiesv1.PolicySetKind:
+			if _, exists := subjects.policySetSubjects[subject.Name]; exists {
+				continue
+			}
+
+			policySet, getErr := GetPolicySet(ctx, c, subject.Name, pb.GetNamespace())
+			if getErr != nil {
+				return policyBindingSubjects{}, getErr
+			}
+
+			if policySet == nil || !IsPolicyListedInPolicySet(policySet, instance.GetName()) {
+				continue
+			}
+
+			subjects.policySetSubjects[subject.Name] = policySet
+
+			subjects.placements = append(subjects.placements, &policiesv1.Placement{
+				PlacementBinding: pb.GetName(),
+				PolicySet:        subject.Name,
+			})
+		}
+	}
+
+	return subjects, nil
+}
+
+func getPolicyPlacementDecisions(
+	ctx context.Context,
+	c client.Client,
+	instance *policiesv1.Policy,
+	pb *policiesv1.PlacementBinding,
+	rawDecisions []string,
+	resolvedSubjects *policyBindingSubjects,
+) (clusterDecisions []string, placements []*policiesv1.Placement, err error) {
+	subjects := resolvedSubjects
+	if subjects == nil {
+		var resolved policyBindingSubjects
+
+		resolved, err = resolvePolicyBindingSubjects(ctx, c, instance, pb)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		subjects = &resolved
+	}
+
+	placements = subjects.placements
+
+	if len(placements) == 0 {
+		// None of the subjects in the PlacementBinding were relevant to this Policy.
+		return nil, nil, nil
+	}
+
+	// If the PlacementRef is invalid, log and return. (This is not recoverable.)
+	if !HasValidPlacementRef(pb) {
+		log.Info(fmt.Sprintf("Placement binding %s/%s placementRef is not valid. Ignoring.", pb.Namespace, pb.Name))
+
+		return nil, nil, nil
+	}
+
+	// If the placementRef exists, then it needs to be added to the placement item
+	refNN := types.NamespacedName{
+		Namespace: pb.GetNamespace(),
+		Name:      pb.PlacementRef.Name,
+	}
+
+	switch pb.PlacementRef.Kind {
+	case "PlacementRule":
+		plr := &appsv1.PlacementRule{}
+		if err := c.Get(ctx, refNN, plr); err != nil && !k8serrors.IsNotFound(err) {
+			return nil, nil, fmt.Errorf("failed to check for PlacementRule '%v': %w", pb.PlacementRef.Name, err)
+		}
+
+		for i := range placements {
+			placements[i].PlacementRule = plr.Name // will be empty if the PlacementRule was not found
+		}
+	case "Placement":
+		pl := &clusterv1beta1.Placement{}
+		if err := c.Get(ctx, refNN, pl); err != nil && !k8serrors.IsNotFound(err) {
+			return nil, nil, fmt.Errorf("failed to check for Placement '%v': %w", pb.PlacementRef.Name, err)
+		}
+
+		for i := range placements {
+			placements[i].Placement = pl.Name // will be empty if the Placement was not found
+		}
+	}
+
+	// If there are no placements, then the PlacementBinding is not for this Policy.
+	if len(placements) == 0 {
+		return nil, nil, nil
+	}
+
+	// If the policy is disabled, don't return any decisions, so that the policy isn't put on any clusters
+	if instance.Spec.Disabled {
+		return nil, placements, nil
+	}
+
+	if rawDecisions != nil {
+		clusterDecisions = append([]string(nil), rawDecisions...)
+	} else {
+		clusterDecisions, err = GetDecisions(ctx, c, pb)
+		if err != nil {
+			return nil, placements, err
+		}
+	}
+
+	return applyPolicySetExclusionsToDecisions(
+		instance, subjects.policySubjectFound, subjects.policySetSubjects, placements, clusterDecisions,
+	)
+}
+
+func applyPolicySetExclusionsToDecisions(
+	instance *policiesv1.Policy,
+	policySubjectFound bool,
+	policySetSubjects map[string]*policiesv1beta1.PolicySet,
+	placements []*policiesv1.Placement,
+	clusterDecisions []string,
+) ([]string, []*policiesv1.Placement, error) {
+	if policySubjectFound || len(policySetSubjects) == 0 {
+		return clusterDecisions, placements, nil
+	}
+
+	pathDecisionSource := append([]string(nil), clusterDecisions...)
+
+	for policySetName, policySet := range policySetSubjects {
+		_, pathExclusions := PartitionClusterDecisionsForListedPolicy(
+			policySet, instance.GetName(), pathDecisionSource,
+		)
+
+		for i := range placements {
+			if placements[i].PolicySet == policySetName {
+				placements[i].Exclusions = pathExclusions
+			}
+		}
+
+		clusterDecisions, _ = PartitionClusterDecisionsForListedPolicy(
+			policySet, instance.GetName(), clusterDecisions,
+		)
+	}
+
+	return clusterDecisions, placements, nil
+}
+
+func resolveBindingPlacementState(
+	ctx context.Context,
+	c client.Client,
+	rootPolicy *policiesv1.Policy,
+	pb *policiesv1.PlacementBinding,
+) (bindingPlacementState, error) {
+	subjects, err := resolvePolicyBindingSubjects(ctx, c, rootPolicy, pb)
+	if err != nil {
+		return bindingPlacementState{}, err
+	}
+
+	state := bindingPlacementState{
+		pb:             pb,
+		trackRemaining: len(subjects.placements) > 0,
+	}
+
+	var rawDecisions []string
+
+	if state.trackRemaining {
+		rawDecisions, err = GetDecisions(ctx, c, pb)
+		if err != nil {
+			return bindingPlacementState{}, err
+		}
+
+		state.rawDecisions = rawDecisions
+	}
+
+	filteredDecisions, placements, err := getPolicyPlacementDecisions(ctx, c, rootPolicy, pb, rawDecisions, &subjects)
+	if err != nil {
+		return bindingPlacementState{}, err
+	}
+
+	state.filteredDecisions = filteredDecisions
+	state.placements = placements
+
+	return state, nil
+}
+
+func collectBindingPlacementStates(
+	ctx context.Context, c client.Client, rootPolicy *policiesv1.Policy,
+) ([]bindingPlacementState, error) {
+	pbList := &policiesv1.PlacementBindingList{}
+
+	err := c.List(ctx, pbList, &client.ListOptions{Namespace: rootPolicy.GetNamespace()})
+	if err != nil {
+		return nil, err
+	}
+
+	states := make([]bindingPlacementState, 0, len(pbList.Items))
+
+	for i := range pbList.Items {
+		state, resolveErr := resolveBindingPlacementState(ctx, c, rootPolicy, &pbList.Items[i])
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+
+		states = append(states, state)
+	}
+
+	return states, nil
+}
+
+func collectRootPolicyPlacementState(
+	ctx context.Context, c client.Client, rootPolicy *policiesv1.Policy,
+) ([]*policiesv1.Placement, DecisionSet, map[string][]policiesv1.RemainingBinding, error) {
+	states, err := collectBindingPlacementStates(ctx, c, rootPolicy)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	placements, decisions := clusterDecisionsFromBindingStates(rootPolicy, states)
+	remainingBindings := remainingBindingsFromBindingStates(rootPolicy, states, decisions)
+
+	return placements, decisions, remainingBindings, nil
+}
+
+func clusterDecisionsFromBindingStates(
+	rootPolicy *policiesv1.Policy, states []bindingPlacementState,
+) ([]*policiesv1.Placement, DecisionSet) {
+	log := log.WithValues("policyName", rootPolicy.GetName(), "policyNamespace", rootPolicy.GetNamespace())
+	decisions := make(map[string]bool)
+	placements := []*policiesv1.Placement{}
+
+	for _, state := range states {
+		if state.pb.SubFilter == policiesv1.Restricted {
+			continue
+		}
+
+		if len(state.filteredDecisions) == 0 {
+			log.V(1).Info("No placement decisions to process for this policy from this non-restricted binding",
+				"policyName", rootPolicy.GetName(), "bindingName", state.pb.GetName())
+		}
+
+		for _, clusterName := range state.filteredDecisions {
+			decisions[clusterName] = true
+		}
+
+		placements = append(placements, state.placements...)
+	}
+
+	for _, state := range states {
+		if state.pb.SubFilter != policiesv1.Restricted {
+			continue
+		}
+
+		foundInDecisions := false
+
+		if len(state.filteredDecisions) == 0 {
+			log.V(1).Info("No placement decisions to process for this policy from this restricted binding",
+				"policyName", rootPolicy.GetName(), "bindingName", state.pb.GetName())
+		}
+
+		for _, clusterName := range state.filteredDecisions {
+			if _, ok := decisions[clusterName]; ok {
+				foundInDecisions = true
+			}
+
+			decisions[clusterName] = true
+		}
+
+		if foundInDecisions {
+			placements = append(placements, state.placements...)
+		}
+	}
+
+	log.V(2).Info("Sorting placements", "RootPolicyName", rootPolicy.Name, "Namespace", rootPolicy.Namespace)
+	sortPlacements(placements)
+
+	return placements, decisions
+}
+
+func remainingBindingsFromBindingStates(
+	rootPolicy *policiesv1.Policy, states []bindingPlacementState, decisions DecisionSet,
+) map[string][]policiesv1.RemainingBinding {
+	if rootPolicy.Spec.Disabled || len(decisions) == 0 {
+		return nil
+	}
+
+	remainingBindings := map[string][]policiesv1.RemainingBinding{}
+
+	for clusterName := range decisions {
+		activeBindings := []policiesv1.RemainingBinding{}
+		excludedOnPath := false
+
+		for _, state := range states {
+			if !state.trackRemaining {
+				continue
+			}
+
+			filtered := false
+			for _, name := range state.filteredDecisions {
+				if name == clusterName {
+					filtered = true
+
+					break
+				}
+			}
+
+			if filtered {
+				activeBindings = append(activeBindings, policiesv1.RemainingBinding{
+					PlacementBinding: state.pb.GetName(),
+				})
+			}
+
+			for _, name := range state.rawDecisions {
+				if name == clusterName && !filtered {
+					excludedOnPath = true
+
+					break
+				}
+			}
+		}
+
+		if excludedOnPath && len(activeBindings) > 0 {
+			sort.Slice(activeBindings, func(i, j int) bool {
+				return activeBindings[i].PlacementBinding < activeBindings[j].PlacementBinding
+			})
+			remainingBindings[clusterName] = activeBindings
+		}
+	}
+
+	return remainingBindings
+}
+
+func sortPlacements(placements []*policiesv1.Placement) {
+	sort.SliceStable(placements, func(i, j int) bool {
+		pi := placements[i].PlacementBinding + " " + placements[i].Placement + " " +
+			placements[i].PlacementRule + " " + placements[i].PolicySet
+		pj := placements[j].PlacementBinding + " " + placements[j].Placement + " " +
+			placements[j].PlacementRule + " " + placements[j].PolicySet
+
+		return pi < pj
+	})
 }

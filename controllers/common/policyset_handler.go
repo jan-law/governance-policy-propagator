@@ -5,6 +5,7 @@ package common
 import (
 	"context"
 
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -29,10 +30,11 @@ func mapPolicySetToRequests(object client.Object) []reconcile.Request {
 	policySet := object.(*policiesv1beta1.PolicySet)
 
 	for _, plc := range policySet.Spec.Policies {
-		log.V(2).Info("Found reconciliation request from a policyset", "policyName", string(plc))
+		policyName := string(plc)
+		log.V(2).Info("Found reconciliation request from a policyset", "policyName", policyName)
 
 		request := reconcile.Request{NamespacedName: types.NamespacedName{
-			Name:      string(plc),
+			Name:      policyName,
 			Namespace: object.GetNamespace(),
 		}}
 		result = append(result, request)
@@ -60,39 +62,70 @@ func (e *EnqueueRequestsFromPolicySet) Update(_ context.Context, evt event.Updat
 	//nolint:forcetypeassert
 	oldPolicySet := evt.ObjectOld.(*policiesv1beta1.PolicySet)
 
-	newPoliciesMap := make(map[string]bool)
-	oldPoliciesMap := make(map[string]bool)
-	diffPolicies := []policiesv1beta1.NonEmptyString{}
+	for _, policyName := range policySetUpdateDiff(oldPolicySet, newPolicySet) {
+		log.V(2).Info("Found reconciliation request from a policyset", "policyName", policyName)
 
-	for _, plc := range newPolicySet.Spec.Policies {
-		newPoliciesMap[string(plc)] = true
-	}
-
-	for _, plc := range oldPolicySet.Spec.Policies {
-		oldPoliciesMap[string(plc)] = true
-	}
-
-	for _, plc := range oldPolicySet.Spec.Policies {
-		if !newPoliciesMap[string(plc)] {
-			diffPolicies = append(diffPolicies, plc)
-		}
-	}
-
-	for _, plc := range newPolicySet.Spec.Policies {
-		if !oldPoliciesMap[string(plc)] {
-			diffPolicies = append(diffPolicies, plc)
-		}
-	}
-
-	for _, plc := range diffPolicies {
-		log.V(2).Info("Found reconciliation request from a policyset", "policyName", string(plc))
-
-		request := reconcile.Request{NamespacedName: types.NamespacedName{
-			Name:      string(plc),
+		q.Add(reconcile.Request{NamespacedName: types.NamespacedName{
+			Name:      policyName,
 			Namespace: newPolicySet.GetNamespace(),
-		}}
-		q.Add(request)
+		}})
 	}
+}
+
+func policySetUpdateDiff(oldPolicySet, newPolicySet *policiesv1beta1.PolicySet) []string {
+	oldPolicies := PolicyNamesInSet(oldPolicySet)
+	newPolicies := PolicyNamesInSet(newPolicySet)
+	oldExclusions := policySetExclusionsByPolicy(oldPolicySet)
+	newExclusions := policySetExclusionsByPolicy(newPolicySet)
+
+	seen := map[string]struct{}{}
+	diff := []string{}
+
+	add := func(policyName string) {
+		if _, ok := seen[policyName]; ok {
+			return
+		}
+
+		seen[policyName] = struct{}{}
+		diff = append(diff, policyName)
+	}
+
+	for policyName := range newPolicies {
+		if !IsPolicyListedInSet(oldPolicies, policyName) {
+			add(policyName)
+		}
+	}
+
+	for policyName := range oldPolicies {
+		if !IsPolicyListedInSet(newPolicies, policyName) {
+			add(policyName)
+		}
+	}
+
+	for policyName, newExclusion := range newExclusions {
+		oldExclusion, ok := oldExclusions[policyName]
+		if !ok || !equality.Semantic.DeepEqual(newExclusion, oldExclusion) {
+			add(policyName)
+		}
+	}
+
+	for policyName := range oldExclusions {
+		if _, ok := newExclusions[policyName]; !ok {
+			add(policyName)
+		}
+	}
+
+	return diff
+}
+
+func policySetExclusionsByPolicy(policySet *policiesv1beta1.PolicySet) map[string]policiesv1beta1.PolicySetExclusion {
+	exclusions := make(map[string]policiesv1beta1.PolicySetExclusion, len(policySet.Spec.Exclusions))
+
+	for _, exclusion := range policySet.Spec.Exclusions {
+		exclusions[string(exclusion.PolicyName)] = exclusion
+	}
+
+	return exclusions
 }
 
 // Delete implements EventHandler

@@ -20,6 +20,40 @@ Every reconcile does the following:
 1. Creates/updates/deletes replicated policies in cluster namespaces based on PlacementBinding/PlacementRule results.
 2. Creates/updates/deletes the policy status to show aggregated cluster compliance results.
 
+### PolicySet cluster exclusions
+
+PolicySet resources support `spec.exclusions` to skip propagating individual policies to specific managed
+clusters while keeping the PolicySet binding intact. Each exclusion entry specifies:
+
+- `policyName` — a policy listed in `spec.policies`
+- `clusterNames` — managed clusters where that policy should not be propagated through the PolicySet path
+- `reason` (optional) — explanation for the exclusion
+
+When exclusions are active, the controller:
+
+- omits replicated policies on excluded clusters for the PolicySet placement path
+- reports active exclusions in `PolicySet.status.exclusions`
+- records excluded clusters on the root policy at `status.placement[].exclusions`
+- records alternate placement bindings at `status.status[].remainingBindings` when another binding still
+  places the policy on that cluster
+
+Example:
+
+```yaml
+apiVersion: policy.open-cluster-management.io/v1beta1
+kind: PolicySet
+metadata:
+  name: example-policyset
+spec:
+  policies:
+    - example-policy
+  exclusions:
+    - policyName: example-policy
+      clusterNames:
+        - managed2
+      reason: incident mitigation
+```
+
 ## Getting started
 
 Go to the

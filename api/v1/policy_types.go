@@ -117,6 +117,11 @@ type PlacementDecision struct {
 	ClusterNamespace string `json:"clusterNamespace,omitempty"`
 }
 
+// PolicyExclusion reports a managed cluster excluded from propagation on this placement path.
+type PolicyExclusion struct {
+	ClusterName string `json:"clusterName,omitempty"`
+}
+
 // Placement reports how and what managed cluster placement resources are attached to the policy.
 type Placement struct {
 	// PlacementBinding is the name of the PlacementBinding resource, from the
@@ -138,6 +143,15 @@ type Placement struct {
 	// specified, then for this placement the policy is being propagated through this policy set
 	// rather than the policy being bound directly to a placement and propagated individually.
 	PolicySet string `json:"policySet,omitempty"`
+
+	// Exclusions lists managed clusters where the policy is excluded from propagation on this path.
+	Exclusions []PolicyExclusion `json:"exclusions,omitempty"`
+}
+
+// RemainingBinding reports a placement binding that still places the policy on a managed cluster
+// when the policy is excluded on another binding path.
+type RemainingBinding struct {
+	PlacementBinding string `json:"placementBinding,omitempty"`
 }
 
 // CompliancePerClusterStatus reports the name of a managed cluster and its compliance state for
@@ -146,6 +160,10 @@ type CompliancePerClusterStatus struct {
 	ComplianceState  ComplianceState `json:"compliant,omitempty"`
 	ClusterName      string          `json:"clustername,omitempty"`
 	ClusterNamespace string          `json:"clusternamespace,omitempty"`
+
+	// RemainingBindings lists placement bindings that still place the policy on this cluster when
+	// the policy is excluded on another binding path.
+	RemainingBindings []RemainingBinding `json:"remainingBindings,omitempty"`
 }
 
 // DetailsPerTemplate reports the current compliance state and list of recent compliance messages
